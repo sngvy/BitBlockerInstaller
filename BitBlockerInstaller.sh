@@ -61,6 +61,31 @@ DHT_SCRIPT="/usr/local/bin/bitblocker-dht-block.sh"
 SOCK_PATH="/run/bitblocker/ndpid.sock"
 LOG_FILE="/var/log/bitblocker.log"
 NDPID_SERVICE="/etc/systemd/system/bitblocker-ndpid.service"
+IPSET_V4="BITBLOCKER-FLOW4"
+IPSET_V6="BITBLOCKER-FLOW6"
+
+migrate_legacy_bitblocker_chain() {
+    local found=0
+    for ipt in iptables ip6tables; do
+        if $ipt -L BITBLOCKER -n &>/dev/null; then
+            found=1
+            for hook in INPUT OUTPUT FORWARD; do
+                while $ipt -C "$hook" -j BITBLOCKER &>/dev/null; do
+                    $ipt -D "$hook" -j BITBLOCKER
+                done
+            done
+            $ipt -F BITBLOCKER
+            $ipt -X BITBLOCKER
+        fi
+    done
+    if [ "$found" -eq 1 ]; then
+        if command -v iptables-save >/dev/null && [ -d /etc/iptables ]; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null
+            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+        fi
+        warn "Обнаружена и удалена устаревшая цепочка BITBLOCKER в таблице filter."
+    fi
+}
 
 uninstall_bitblocker() {
     echo -e "${B_CYAN}${BOLD}Удаление BitBlocker${NC}"
@@ -77,23 +102,42 @@ uninstall_bitblocker() {
     systemctl daemon-reload
 
     for ipt in iptables ip6tables; do
-        for chain in BITBLOCKER BITBLOCKER-DHT; do
-            if $ipt -L "$chain" -n &>/dev/null; then
-                for hook in INPUT OUTPUT FORWARD; do
-                    while $ipt -C "$hook" -j "$chain" &>/dev/null; do
-                        $ipt -D "$hook" -j "$chain"
-                    done
+        if $ipt -t raw -L BITBLOCKER -n &>/dev/null; then
+            for hook in PREROUTING OUTPUT; do
+                while $ipt -t raw -C "$hook" -j BITBLOCKER &>/dev/null; do
+                    $ipt -t raw -D "$hook" -j BITBLOCKER
                 done
-                $ipt -F "$chain"
-                $ipt -X "$chain"
-                ok "Цепочка $chain в $ipt удалена."
-            fi
-        done
+            done
+            $ipt -t raw -F BITBLOCKER
+            $ipt -t raw -X BITBLOCKER
+            ok "Цепочка BITBLOCKER (raw) в $ipt удалена."
+        fi
     done
+
+    for ipt in iptables ip6tables; do
+        if $ipt -L BITBLOCKER-DHT -n &>/dev/null; then
+            for hook in INPUT OUTPUT FORWARD; do
+                while $ipt -C "$hook" -j BITBLOCKER-DHT &>/dev/null; do
+                    $ipt -D "$hook" -j BITBLOCKER-DHT
+                done
+            done
+            $ipt -F BITBLOCKER-DHT
+            $ipt -X BITBLOCKER-DHT
+            ok "Цепочка BITBLOCKER-DHT (filter) в $ipt удалена."
+        fi
+    done
+
     if command -v iptables-save >/dev/null && [ -d /etc/iptables ]; then
         iptables-save > /etc/iptables/rules.v4 2>/dev/null
         ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
     fi
+
+    for s in "$IPSET_V4" "$IPSET_V6"; do
+        if ipset list "$s" &>/dev/null; then
+            ipset destroy "$s" 2>/dev/null
+            ok "ipset $s удалён."
+        fi
+    done
 
     if command -v ufw >/dev/null; then
         if grep -q 'BitBlocker-DHT' /etc/ufw/user.rules 2>/dev/null || grep -q 'BitBlocker-DHT' /etc/ufw/user6.rules 2>/dev/null; then
@@ -120,7 +164,7 @@ uninstall_bitblocker() {
 
     echo
     echo -e "${B_GREEN}${BOLD}BitBlocker полностью удалён.${NC}"
-    warn "Пакеты (git, cmake, iptables-persistent, ufw и т.п.) не удалялись — они могут использоваться системой."
+    warn "Пакеты (git, cmake, iptables-persistent, ufw, ipset и т.п.) не удалялись — они могут использоваться системой."
 }
 
 echo -e "${B_CYAN}${BOLD}BitBlocker${NC}"
@@ -139,12 +183,15 @@ case "$ACTION_CHOICE" in
 esac
 echo
 
+migrate_legacy_bitblocker_chain
+
 echo -e "${BOLD}Конфигурация BitBlocker${NC}"
 echo
 echo -e "BitBlocker работает на базе ${BOLD}nDPId${NC} (userspace DPI, без кастомного ядерного"
 echo -e "модуля): nDPId захватывает трафик на интерфейсе и классифицирует потоки через nDPI,"
 echo -e "а слушатель BitBlocker разбирает его JSON-события и точечно блокирует обнаруженные"
-echo -e "BitTorrent-потоки через iptables (DROP + сброс уже установленного соединения через conntrack)."
+echo -e "BitTorrent-потоки через ipset+iptables (таблица RAW) с автоматическим"
+echo -e "удалением записей по TTL и сбрасывает уже установленное соединение через conntrack."
 echo -e "Отдельным демоном блокируются известные DHT-бутстрап ноды (с периодическим обновлением IP)."
 echo
 
@@ -304,7 +351,7 @@ export DEBIAN_FRONTEND=noninteractive
 log "Обновление списка пакетов и установка зависимостей..."
 apt-get update -qq
 
-BASE_PKGS="build-essential git cmake gettext flex bison libtool autoconf automake pkg-config libpcap-dev libjson-c-dev libnuma-dev libpcre2-dev libmaxminddb-dev librrd-dev python3 conntrack wget unzip util-linux dnsutils"
+BASE_PKGS="build-essential git cmake gettext flex bison libtool autoconf automake pkg-config libpcap-dev libjson-c-dev libnuma-dev libpcre2-dev libmaxminddb-dev librrd-dev python3 conntrack ipset wget unzip util-linux dnsutils"
 
 if [ "$FW_MODE" = "ufw" ]; then
     apt-get install -y -qq ufw $BASE_PKGS
@@ -408,6 +455,10 @@ SOCK_PATH = "/run/bitblocker/ndpid.sock"
 LOG_FILE = "/var/log/bitblocker.log"
 DETECT_EVENTS = {"detected", "guessed", "detection-update"}
 
+IPSET_TIMEOUT = "3600"
+IPSET_V4 = "BITBLOCKER-FLOW4"
+IPSET_V6 = "BITBLOCKER-FLOW6"
+
 _seen_flows = set()
 
 
@@ -428,14 +479,27 @@ def run(cmd):
         pass
 
 
+def check(cmd):
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return result.returncode == 0
+
+
 def ensure_chain():
-    for ipt in ("iptables", "ip6tables"):
-        run([ipt, "-N", "BITBLOCKER"])
-        for chain in ("INPUT", "OUTPUT", "FORWARD"):
-            check = subprocess.run([ipt, "-C", chain, "-j", "BITBLOCKER"],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if check.returncode != 0:
-                run([ipt, "-I", chain, "-j", "BITBLOCKER"])
+    run(["ipset", "create", IPSET_V4, "hash:ip,port,ip,port", "timeout", IPSET_TIMEOUT, "family", "inet"])
+    run(["ipset", "create", IPSET_V6, "hash:ip,port,ip,port", "timeout", IPSET_TIMEOUT, "family", "inet6"])
+
+    for ipt, ipset_name in (("iptables", IPSET_V4), ("ip6tables", IPSET_V6)):
+        run([ipt, "-t", "raw", "-N", "BITBLOCKER"])
+
+        for chain in ("PREROUTING", "OUTPUT"):
+            if not check([ipt, "-t", "raw", "-C", chain, "-j", "BITBLOCKER"]):
+                run([ipt, "-t", "raw", "-I", chain, "-j", "BITBLOCKER"])
+
+        for direction in ("src,dst", "dst,src"):
+            if not check([ipt, "-t", "raw", "-C", "BITBLOCKER", "-m", "set",
+                          "--match-set", ipset_name, direction, "-j", "DROP"]):
+                run([ipt, "-t", "raw", "-A", "BITBLOCKER", "-m", "set",
+                     "--match-set", ipset_name, direction, "-j", "DROP"])
 
 
 def block_flow(event):
@@ -452,16 +516,13 @@ def block_flow(event):
         return
     _seen_flows.add(key)
 
-    ipt = "ip6tables" if ":" in src_ip else "iptables"
+    is_v6 = ":" in src_ip
+    ipset_name = IPSET_V6 if is_v6 else IPSET_V4
+    ipt = "ip6tables" if is_v6 else "iptables"
 
-    run([ipt, "-A", "BITBLOCKER", "-p", l4,
-         "-s", src_ip, "--sport", str(src_port),
-         "-d", dst_ip, "--dport", str(dst_port), "-j", "DROP"])
-    run([ipt, "-A", "BITBLOCKER", "-p", l4,
-         "-s", dst_ip, "--sport", str(dst_port),
-         "-d", src_ip, "--dport", str(src_port), "-j", "DROP"])
+    run(["ipset", "add", ipset_name,
+         f"{src_ip},{l4}:{src_port},{dst_ip},{l4}:{dst_port}", "-exist"])
 
-    # DROP не рвёт уже установленное соединение
     run(["conntrack", "-D", "-p", l4, "-s", src_ip, "--sport", str(src_port),
          "-d", dst_ip, "--dport", str(dst_port)])
 
@@ -469,9 +530,9 @@ def block_flow(event):
     log("SUCCESS", f"Заблокирован поток {proto_name}: {src_ip}:{src_port} -> {dst_ip}:{dst_port} ({l4})")
 
 
-def handle_event(raw):
+def handle_event(raw_bytes):
     try:
-        event = json.loads(raw)
+        event = json.loads(raw_bytes)
     except json.JSONDecodeError:
         return
 
@@ -739,19 +800,20 @@ elif [ -n "$BPF_FILTER" ]; then
 else
     echo -e "${B_GREEN}Анализируется весь трафик на интерфейсе (без ограничения по портам).${NC}"
 fi
-echo -e "${B_GREEN}Обнаруженные BitTorrent-потоки блокируются точечно (DROP + conntrack -D).${NC}"
+echo -e "${B_GREEN}Обнаруженные BitTorrent-потоки блокируются точечно через ipset + RAW (DROP + conntrack -D).${NC}"
 echo -e "${B_GREEN}DHT-бутстрап ноды блокируются статически, обновление списка IP — каждые 30 минут.${NC}"
 echo
 echo -e "${B_CYAN}Статус слушателя:${NC} ${BOLD}systemctl status bitblocker-listener${NC}"
 echo -e "${B_CYAN}Статус nDPId:${NC} ${BOLD}systemctl status bitblocker-ndpid${NC}"
 echo -e "${B_CYAN}Статус DHT-таймера:${NC} ${BOLD}systemctl status bitblocker-dht-block.timer${NC}"
 echo -e "${B_CYAN}Следующий запуск обновления DHT:${NC} ${BOLD}systemctl list-timers bitblocker-dht-block.timer${NC}"
-echo -e "${B_CYAN}Текущие правила (IPv4):${NC} ${BOLD}iptables -L BITBLOCKER -n -v${NC}"
-echo -e "${B_CYAN}Текущие правила (IPv6):${NC} ${BOLD}ip6tables -L BITBLOCKER -n -v${NC}"
+echo -e "${B_CYAN}Текущие правила (IPv4):${NC} ${BOLD}iptables -t raw -L BITBLOCKER -n -v${NC}"
+echo -e "${B_CYAN}Текущие правила (IPv6):${NC} ${BOLD}ip6tables -t raw -L BITBLOCKER -n -v${NC}"
+echo -e "${B_CYAN}Активные заблокированные потоки:${NC} ${BOLD}ipset list $IPSET_V4${NC} / ${BOLD}ipset list $IPSET_V6${NC}"
 if [ "$FW_MODE" = "ufw" ]; then
     echo -e "${B_CYAN}Правила DHT-блокировки:${NC} ${BOLD}ufw status | grep BitBlocker-DHT${NC}"
     echo -e "${B_YELLOW}Примечание: BITBLOCKER (точечные потоки) всегда управляется напрямую через${NC}"
-    echo -e "${B_YELLOW}iptables/ip6tables — у UFW нет механизма для динамических правил по потокам.${NC}"
+    echo -e "${B_YELLOW}iptables/ip6tables (таблица RAW + ipset) — у UFW нет механизма для этого.${NC}"
     echo -e "${B_YELLOW}А вот BITBLOCKER-DHT — статичный список IP, поэтому идёт через сам UFW (ufw deny).${NC}"
 else
     echo -e "${B_CYAN}Правила DHT-блокировки:${NC} ${BOLD}iptables -L BITBLOCKER-DHT -n -v${NC}"
@@ -759,8 +821,8 @@ fi
 echo -e "${B_CYAN}Лог BitBlocker:${NC} ${BOLD}$LOG_FILE${NC}"
 echo -e "${B_CYAN}Справка nDPId:${NC} ${BOLD}$NDPID_BIN -h${NC}"
 echo
-warn "Правила BITBLOCKER создаются динамически по мере обнаружения трафика — после перезагрузки"
-warn "цепочка пересоздаётся пустой и наполняется заново при появлении нового BitTorrent-трафика."
+warn "Записи в ipset ($IPSET_V4/$IPSET_V6) имеют TTL 3600 секунд и удаляются сами, размер"
+warn "цепочки BITBLOCKER в iptables/ip6tables фиксирован и не растёт со временем."
 warn "DHT-блокировка (BITBLOCKER-DHT) статическая и не зависит от DPI — переживает перезагрузку"
 warn "и сама переустанавливается при первом запуске таймера (до 1 минуты после старта системы)."
 warn "Ничего из этого не гарантирует 100% блокировку сильно обфусцированного/зашифрованного трафика."
